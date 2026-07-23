@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Flaky Network — Design Summary</title>
+<style>
+  :root { --fg:#1a1d21; --muted:#5f6672; --line:#d9dde3; --bg:#ffffff; --panel:#f5f7f9; --accent:#0b6bcb; --good:#0a7d33; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6e8eb; --muted:#9aa2ad; --line:#333a42; --bg:#111417; --panel:#1a1f24; --accent:#5aa2e8; --good:#4fbf72; --bad:#e5766f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width: 900px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size:1.9rem; line-height:1.25; margin:0 0 .25rem; }
+  h2 { font-size:1.3rem; margin:2.5rem 0 .75rem; padding-top:1rem; border-top:1px solid var(--line); }
+  h3 { font-size:1.05rem; margin:1.5rem 0 .5rem; }
+  p.lead { color:var(--muted); margin-top:0; }
+  code, pre { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size:.9em; }
+  code { background:var(--panel); padding:.1em .35em; border-radius:4px; }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:1rem; overflow-x:auto; line-height:1.45; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.92rem; }
+  th, td { border:1px solid var(--line); padding:.45rem .65rem; text-align:left; vertical-align:top; }
+  th { background:var(--panel); }
+  .num { text-align:right; font-variant-numeric: tabular-nums; }
+  .ok { color:var(--good); font-weight:600; } .no { color:var(--bad); font-weight:600; }
+  .callout { background:var(--panel); border-left:4px solid var(--accent); border-radius:0 8px 8px 0; padding: .75rem 1rem; margin:1rem 0; }
+  .scroll { overflow-x:auto; }
+  ul { padding-left:1.3rem; }
+  li { margin:.3rem 0; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>The Flaky Network</h1>
+<p class="lead">Loss-tolerant, low-latency frame transport over a hostile UDP relay — C++17, standard library only.
+Sender and receiver sit on either side of a relay that drops, delays, reorders, and duplicates packets.
+Score: lowest playout delay with ≤ 1% deadline misses and ≤ 2.0× bandwidth.</p>
+
+<h2>System architecture</h2>
+<div class="scroll"><pre><code>harness source ──47010──▶ SENDER ──47001──▶ relay ──47002──▶ RECEIVER ──47020──▶ harness player
+ (frame i at t0+i·20ms)      ▲              (hostile)             │            (deadline t0+DELAY+i·20ms)
+                             │                                    │
+                          47004 ◀────────── relay ◀──────────── 47003
+                                     (NACK feedback, impaired too)</code></pre></div>
+
+<ul>
+  <li><strong>Sender</strong> (<code>sender.cpp</code>): single-threaded <code>poll()</code> loop over two UDP sockets — harness frames in on 47010, NACKs in on 47004. Keeps every payload in a 2<sup>16</sup>-slot history ring (owner of all frame memory on its side; fixed-size, no allocation in the hot path). Each incoming frame is forwarded immediately inside one packet that also carries FEC (below).</li>
+  <li><strong>Receiver</strong> (<code>receiver.cpp</code>): single-threaded <code>poll()</code> loop on 47002. Owns three flat arrays indexed by sequence number: known payloads, stored parity blocks, and per-frame NACK state — O(1) lookups, no maps, no locks. Every frame is forwarded to the player the moment it is first known.</li>
+  <li>Neither process ever blocks on a socket outside <code>poll()</code> readiness (<code>MSG_DONTWAIT</code> drain loop), so a stall on one path can never delay the other. Sequence numbers stay 4-byte big-endian end to end; only the flags byte and payload bytes are added between the harness legs.</li>
+</ul>
+
+<h2>The three insights the design is built on</h2>
+
+<h3>1. The player judges first arrival — so there is no jitter buffer at all</h3>
+<p>The harness player records the <em>first</em> packet per sequence number and compares its arrival time to the deadline; order is irrelevant and late duplicates are ignored. A classical playout buffer would only add delay. The receiver therefore forwards each frame the instant it is first received <em>or decoded</em>, and suppresses duplicates with a bitmap. "Playout delay" exists purely as the harness's deadline slack, which our recovery paths must fit inside.</p>
+
+<h3>2. The 2.0× budget forbids duplication — but buys one parity block per packet</h3>
+<p>The overhead cap counts every byte the relay receives against <code>n × 160 B</code> of raw payload: a budget of 320 B per frame. Sending each 160 B frame twice already costs 320 B <em>before any header</em>, so plain duplication mathematically cannot fit. Instead each packet carries one 160 B <strong>XOR parity block</strong> next to its own frame, and every 16th packet omits it:</p>
+<pre><code>media packet  =  [4B seq BE][1B flags][160B frame i][160B XOR(frame i−1, frame i−3)]
+average bytes =  5 + 160 + (15/16)·160  ≈ 315 B/frame  →  1.97× (measured: 1.97×)</code></pre>
+
+<h3>3. A resend costs three network crossings — parity costs one</h3>
+<p>A NACK'd retransmit needs the loss detected (≈ one crossing after the loss), the request delivered, and the reply delivered — each leg through 20–80 ms of hostile jitter. Forward parity rides on the very next packets: a lost frame decodes 20 ms later plus one crossing. That is why FEC is the primary mechanism and retransmission only the last resort.</p>
+
+<h2>The FEC: a spread XOR chain</h2>
+<p>Packet <code>k</code> carries <code>XOR(k−1, k−3)</code>. Each frame is covered by two later packets (<code>+1</code> and <code>+3</code>), giving:</p>
+<ul>
+  <li><strong>Single loss</strong>: frame <code>m</code> decodes from packet <code>m+1</code> (parity ⊕ frame <code>m−3</code>) — recovery at +20 ms + one network delay. This sets the delay floor.</li>
+  <li><strong>Loss bursts</strong>: consecutive losses defeat adjacent redundancy, but the spread cover decodes them by back-substitution. E.g. burst <code>{m, m+1, m+2}</code>: packet <code>m+3</code> yields nothing yet, <code>m+4</code> decodes <code>m+1</code>, then <code>m+5</code> decodes <code>m+2</code>, then <code>m+3</code>'s stored parity decodes <code>m</code>. The receiver implements this as a worklist: every newly known frame re-examines the two parities that cover it, cascading until fixpoint.</li>
+  <li><strong>Duplicates/reordering</strong>: parity storage and frame delivery are both idempotent; a parity whose two covered frames are already known is discarded as spent.</li>
+</ul>
+<p>The spread <code>S</code> (default 3) and skip modulus are env-tunable (<code>FLAKY_S</code>, <code>FLAKY_SKIP</code>); the flags byte encodes the scheme per packet, so sender and receiver need no out-of-band agreement.</p>
+
+<h2>The NACK path (last resort, budget-guarded)</h2>
+<p>The receiver tracks gaps below the highest sequence seen. A gap older than a 25 ms reorder guard, not yet decoded, NACK'd fewer than 2 times, and whose deadline is still reachable (now + one estimated round trip &lt; deadline) is batched into a compact NACK — <code>[1B count][4B seq…]</code> — on port 47003. The sender resends the requested frame as a normal single-frame packet, rate-limited per sequence, and refuses any resend that would push cumulative relay bytes past 1.98× of raw-so-far. On steady profiles NACKs almost never fire (34 feedback bytes across a whole 30 s run on profile B); after long loss bursts they rescue the tail frames whose deadlines survive the blackout.</p>
+
+<h2>What the numbers showed</h2>
+<div class="scroll">
+<table>
+  <tr><th>Profile</th><th>Naive baseline</th><th>This design</th><th>Floor found</th></tr>
+  <tr><td>A — 2% loss, 10–40 ms jitter</td><td class="no">16.4% miss @ 40 ms</td><td class="ok">0.00–0.60% miss</td><td class="num">55 ms</td></tr>
+  <tr><td>B — 5% loss, 20–80 ms jitter</td><td class="no">75.5% miss @ 40 ms</td><td class="ok">0.87–0.93% miss</td><td class="num">100 ms</td></tr>
+  <tr><td>C2 — custom burst/spike stress</td><td>—</td><td class="no">1.33% @ 130 ms</td><td class="num">burst-limited</td></tr>
+</table>
+</div>
+<p>Profile B's floor matches theory exactly: a lost frame's earliest second chance is packet <code>i+1</code>, sent 20 ms later, plus up to 80 ms of relay delay — 100 ms. Overhead is a flat 1.97× everywhere. The graded delay of <strong>110 ms</strong> keeps ≥ 10 ms margin over the harsher public profile.</p>
+
+<h2>Failure modes (known and accepted)</h2>
+<ul>
+  <li>Loss bursts longer than ~S packets shred the parity chain itself; only burst tails whose deadlines outlive the blackout can be NACK-rescued. A blackout longer than <code>DELAY_MS</code> minus one crossing is information-theoretically unrecoverable under any ≤ 2× scheme — nothing about a frame can reach the receiver until some packet survives.</li>
+  <li>Delay spikes above <code>DELAY_MS − 20 ms</code> on a recovery carrier turn an otherwise-recovered loss into a miss.</li>
+  <li>The every-16th skip class leaves ~6% of frames with one cover instead of two; at 5% loss this contributes ≈ 0.3% residual misses — the price of the byte cap.</li>
+</ul>
+
+</main>
+</body>
+</html>

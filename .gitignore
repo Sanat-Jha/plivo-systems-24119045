@@ -1,0 +1,10 @@
+# build outputs
+sender
+receiver
+# harness run artifacts
+playout_log.json
+relay_stats.json
+__pycache__/
+# dev helpers (not part of submission)
+inspect_log.py
+sweep.sh
