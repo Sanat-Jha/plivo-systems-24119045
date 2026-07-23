@@ -21,13 +21,24 @@
  * exactly 2.0x before any header), so we skip ~1/16 of aux blocks and stay
  * ~1.97x.
  *
- * NACK format (from receiver): [1B count][count x 4B seq BE].
- * Resends are single-frame media packets, rate-limited per seq and gated by
- * a global byte budget so overhead can never cross the cap.
+ * Feedback packets (from receiver, port 47004):
+ *   [1B count][count x 4B seq BE]  count 1..32  = NACK, resend those frames
+ *   [0xFF][1B S]                                = adaptive-spread advisory
+ *
+ * NACK'd frames within 7 seqs of each other are BUNDLED two per resend
+ * packet using the copy-block wire format (primary = higher seq, aux = plain
+ * copy of the lower) -- one header instead of two, so the byte budget funds
+ * more retries. Resends are rate-limited per seq and gated by a global byte
+ * budget so overhead can never cross the cap.
+ *
+ * The advisory closes an adaptation loop: the receiver observes loss-burst
+ * lengths and asks for a wider parity spread S; the sender only ever widens
+ * (never shrinks), and the receiver sees the new S in the parity flags of
+ * subsequent packets, which stops the advisories.
  *
  * Env: T0, DURATION_S, DELAY_MS (harness). Tuning knobs (optional):
- *   FLAKY_MODE (xor|pb, default xor), FLAKY_S (spread, default 3),
- *   FLAKY_D (default 1), FLAKY_SKIP (16).
+ *   FLAKY_MODE (xor|pb, default xor), FLAKY_S (starting spread, default 3),
+ *   FLAKY_D (default 1), FLAKY_SKIP (16), FLAKY_DEBUG (0).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -95,6 +106,7 @@ int main() {
     int S = env_int("FLAKY_S", 3);              // xor spread: covers seq-1, seq-S
     if (S < 2) S = 2;
     if (S > 7) S = 7;
+    const bool dbg = env_int("FLAKY_DEBUG", 0) != 0;
     const int D = env_int("FLAKY_D", 1);        // copy offset in pb mode (1..7)
     const int SKIP = env_int("FLAKY_SKIP", 16); // skip aux when seq%SKIP==0
     // last frame of the run has no successor packet to piggyback it: send twice
@@ -168,30 +180,65 @@ int main() {
 
         if (pfds[1].revents & POLLIN) {
             ssize_t n = recvfrom(fb_fd, buf, sizeof buf, 0, NULL, NULL);
-            if (n >= 1) {
+            if (n == 2 && buf[0] == 0xFF) {
+                // adaptive-spread advisory: widen S (never shrink)
+                int sug = buf[1];
+                if (sug > S && sug <= 7) {
+                    if (dbg)
+                        fprintf(stderr, "[sender] widening spread S %d -> %d\n",
+                                S, sug);
+                    S = sug;
+                }
+            } else if (n >= 1 && buf[0] >= 1 && buf[0] <= 32 &&
+                       n == 1 + 4 * (int)buf[0]) {
+                // NACK: collect resendable seqs, then send bundled pairs
+                double t = now_s();
                 int count = buf[0];
-                if (n == 1 + 4 * count) {
-                    double t = now_s();
-                    for (int k = 0; k < count; k++) {
-                        uint32_t seq_n;
-                        memcpy(&seq_n, buf + 1 + 4 * k, 4);
-                        uint32_t seq = ntohl(seq_n);
-                        Slot &s = hist[seq % HISTORY];
-                        if (!s.valid || s.seq != seq) continue;
-                        if (t - s.last_resend < 0.040) continue;  // per-seq rate limit
-                        // budget guard: never let total bytes cross ~1.98x raw so far
-                        if (bytes_sent + 5 + PAYLOAD >
-                            (uint64_t)(1.98 * frames_seen * PAYLOAD))
-                            continue;
-                        s.last_resend = t;
-                        uint32_t be = htonl(seq);
-                        memcpy(pkt, &be, 4);
+                uint32_t list[32];
+                int m = 0;
+                for (int k = 0; k < count; k++) {
+                    uint32_t seq_n;
+                    memcpy(&seq_n, buf + 1 + 4 * k, 4);
+                    uint32_t seq = ntohl(seq_n);
+                    Slot &s = hist[seq % HISTORY];
+                    if (!s.valid || s.seq != seq) continue;
+                    if (t - s.last_resend < 0.040) continue;  // per-seq rate limit
+                    list[m++] = seq;
+                }
+                for (int i = 0; i < m;) {
+                    // pair adjacent requests when the copy block can reach
+                    bool pair = i + 1 < m && list[i + 1] > list[i] &&
+                                list[i + 1] - list[i] <= 7;
+                    size_t len = pair ? 5 + 2 * PAYLOAD : 5 + PAYLOAD;
+                    // budget guard: never let total bytes cross ~1.98x raw so far
+                    if (bytes_sent + len > (uint64_t)(1.98 * frames_seen * PAYLOAD))
+                        break;
+                    uint32_t primary = pair ? list[i + 1] : list[i];
+                    Slot &sp = hist[primary % HISTORY];
+                    uint32_t be = htonl(primary);
+                    memcpy(pkt, &be, 4);
+                    memcpy(pkt + 5, sp.payload, PAYLOAD);
+                    if (pair) {
+                        uint32_t d = list[i + 1] - list[i];
+                        Slot &sl = hist[list[i] % HISTORY];
+                        pkt[4] = (unsigned char)d;  // aux = copy of primary-d
+                        memcpy(pkt + 5 + PAYLOAD, sl.payload, PAYLOAD);
+                        sl.last_resend = t;
+                    } else {
                         pkt[4] = 0;
-                        memcpy(pkt + 5, s.payload, PAYLOAD);
-                        sendto(out_fd, pkt, 5 + PAYLOAD, 0,
-                               (struct sockaddr *)&relay, sizeof relay);
-                        bytes_sent += 5 + PAYLOAD;
                     }
+                    sp.last_resend = t;
+                    sendto(out_fd, pkt, len, 0, (struct sockaddr *)&relay,
+                           sizeof relay);
+                    bytes_sent += len;
+                    if (dbg) {
+                        if (pair)
+                            fprintf(stderr, "[sender] resend pair %u+%u\n",
+                                    list[i], primary);
+                        else
+                            fprintf(stderr, "[sender] resend %u\n", primary);
+                    }
+                    i += pair ? 2 : 1;
                 }
             }
         }

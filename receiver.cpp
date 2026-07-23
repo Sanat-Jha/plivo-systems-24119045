@@ -17,8 +17,24 @@
  * the two becomes known the other is decoded, which can cascade (worklist),
  * so a burst of up to S lost packets is recovered by chaining parities.
  *
+ * Adaptive spread: the receiver records which packets ever arrived (primary
+ * seq, independent of FEC decoding); runs of packets still unseen 150 ms
+ * after their send time are measured loss bursts — the network's behavior,
+ * not the decoder's luck, and immune to reordering and jitter.
+ * Widening the spread only pays if the far carrier (packet m+S, sent S*20 ms
+ * after frame m) can still land before m's deadline, and a too-wide S makes
+ * every parity depend on a frame further back, lengthening decode chains in
+ * exactly the burst regions it is meant to fix. So the suggestion is capped
+ * deadline-aware: sender and receiver share the host clock, so arrival time
+ * minus (T0 + seq*20ms) measures true one-way delay; the advisory is
+ * min(longest burst + 1, (DELAY_MS - p90_delay - 10ms) / 20ms), sent as
+ * [0xFF][1B suggested S] on the feedback port every 200 ms until the parity
+ * flags reflect the new S. On low-deadline-headroom profiles this cap keeps
+ * S at the baseline and the advisory never fires.
+ *
  * Env: T0, DURATION_S, DELAY_MS (harness). Tuning knobs (optional):
- *   FLAKY_NACK (default 1), FLAKY_NACK_WAIT_MS (25), FLAKY_NACK_MAX (2).
+ *   FLAKY_NACK (default 1), FLAKY_NACK_WAIT_MS (25), FLAKY_NACK_MAX (2),
+ *   FLAKY_ADAPT (default 1), FLAKY_DEBUG (0).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -26,6 +42,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +102,8 @@ int main() {
     const bool nack_on = env_int("FLAKY_NACK", 1) != 0;
     const double nack_wait = env_int("FLAKY_NACK_WAIT_MS", 25) / 1000.0;
     const int nack_max = env_int("FLAKY_NACK_MAX", 2);
+    const bool adapt_on = env_int("FLAKY_ADAPT", 1) != 0;
+    const bool dbg = env_int("FLAKY_DEBUG", 0) != 0;
 
     const size_t max_frames = (size_t)(dur * 50) + 256;
 
@@ -94,8 +113,9 @@ int main() {
     std::vector<unsigned char> pdata(max_frames * PAYLOAD);
     std::vector<bool> phave(max_frames, false);
     std::vector<uint8_t> pspread(max_frames, 0);  // S of each stored parity
-    int s_seen = 2;  // sender's spread, learned from parity flags
+    int s_seen = 3;  // sender's spread, learned from parity flags
     std::vector<Track> track(max_frames);
+    std::vector<bool> parr(max_frames, false);  // packet with this primary seq arrived
     std::vector<uint32_t> work;  // newly-known frames to run against parities
 
     int in_fd = udp_bind(47002);
@@ -105,6 +125,11 @@ int main() {
 
     int64_t highest = -1;  // highest seq seen in any packet
     double last_nack_send = 0.0;
+    int max_burst = 0;       // longest hard-missing run observed so far
+    double last_adv = 0.0;   // last adaptive-spread advisory sent
+    double last_scan = 0.0;  // last burst-measurement scan
+    double dsamp[128];       // recent one-way delay samples (ring)
+    int dn = 0, di = 0;
 
     unsigned char buf[2048];
     unsigned char out[4 + PAYLOAD];
@@ -144,8 +169,11 @@ int main() {
         while (!work.empty()) {
             uint32_t f = work.back();
             work.pop_back();
-            try_parity(f + 1);       // parity in packet f+1 covers f as "k-1"
-            try_parity(f + s_seen);  // parity in packet f+S covers f as "k-S"
+            // f can be covered by packet f+1 (as "k-1") or f+s (as "k-s") for
+            // whatever spread s that parity was built with; S may change
+            // mid-run, so probe all stored parities that could reference f —
+            // try_parity() checks its own cover pair, spurious calls are no-ops
+            for (uint32_t k = f + 1; k <= f + 7; k++) try_parity(k);
         }
     };
 
@@ -162,7 +190,17 @@ int main() {
                 uint32_t seq = ntohl(seq_n);
                 unsigned char flags = buf[4];
 
-                if (n >= 5 + PAYLOAD) learn(seq, buf + 5);
+                if (n >= 5 + PAYLOAD) {
+                    if (seq < max_frames) {
+                        parr[seq] = true;  // this packet made it (loss ground truth)
+                        if (t0 > 0.0) {    // one-way delay sample
+                            dsamp[di] = t - (t0 + seq * 0.020);
+                            di = (di + 1) & 127;
+                            if (dn < 128) dn++;
+                        }
+                    }
+                    learn(seq, buf + 5);
+                }
                 if (flags != 0 && n >= 5 + 2 * PAYLOAD) {
                     if (flags >= 1 && flags <= 7) {          // plain copy of seq-D
                         if (seq >= flags) learn(seq - flags, buf + 5 + PAYLOAD);
@@ -188,6 +226,47 @@ int main() {
                             track[m].missing_since = t;
                     highest = seq;
                 }
+            }
+        }
+
+        if (adapt_on && highest >= 0 && t0 > 0.0 && t - last_scan >= 0.020) {
+            last_scan = t;
+            // longest run of packets that never arrived, 150 ms past their
+            // send time: measured network loss bursts, independent of
+            // whether the FEC decoder happened to recover the frames
+            int64_t hi = (int64_t)((t - t0 - 0.150) / 0.020);
+            if (hi > highest) hi = highest;
+            int cur = 0;
+            int64_t lo = hi - 256 < 0 ? 0 : hi - 256;
+            for (int64_t m = lo; m <= hi; m++) {
+                bool lost = (size_t)m < max_frames && !parr[m];
+                cur = lost ? cur + 1 : 0;
+                if (cur > max_burst) max_burst = cur;
+            }
+            // deadline-aware cap: the far carrier m+S is sent S*20 ms after
+            // frame m and needs ~p90 network delay + decode margin to land
+            int s_useful = 3;
+            if (dn >= 32) {
+                double tmp[128];
+                memcpy(tmp, dsamp, dn * sizeof(double));
+                std::nth_element(tmp, tmp + dn * 9 / 10, tmp + dn);
+                double p90_ms = tmp[dn * 9 / 10] * 1000.0;
+                s_useful = (int)((delay_s * 1000.0 - p90_ms - 10.0) / 20.0);
+                if (s_useful < 3) s_useful = 3;
+                if (s_useful > 7) s_useful = 7;
+            }
+            int sug = max_burst + 1;
+            if (sug > s_useful) sug = s_useful;
+            if (sug < 3) sug = 3;
+            if (sug > s_seen && t - last_adv >= 0.200) {
+                unsigned char adv[2] = {0xFF, (unsigned char)sug};
+                sendto(out_fd, adv, 2, 0, (struct sockaddr *)&fb, sizeof fb);
+                last_adv = t;
+                if (dbg)
+                    fprintf(stderr,
+                            "[receiver] burst run %d seen, useful cap %d, "
+                            "advising S=%d (sender at %d)\n",
+                            max_burst, s_useful, sug, s_seen);
             }
         }
 

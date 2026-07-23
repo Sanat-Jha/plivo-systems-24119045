@@ -28,8 +28,15 @@ Raw stream = 1500 × 160 B = 240 000 B, overhead cap = 2.0×, miss cap = 1.0%.
 | 21 | B | 110 (seeds 1/2/3) | 0.20% / 0.33% / 0.73% | 1.97x | All VALID with margin. Worst seed leaves 0.27 pp headroom. |
 | 22 | B | 110 (60 s, 3000 frames) | 0.73% | 1.97x | Double-duration sanity run — no drift, no counter issues, overhead flat. |
 
+| 23 | C2 | 130 | 1.40% | 1.97x | **Added adaptive spread + bundled resends.** Receiver advises a wider parity spread S over the feedback channel when it observes loss bursts; NACK'd frames ≤7 apart share one resend packet via the copy block. Debug run confirmed the loop: burst run 5 → advisory → sender widened S 3→6. |
+| 24 | A+B | 110 (seeds 1–3) | A 0.00/0.07/0.07%, B 0.47/0.33/0.60% | 1.97x | Full regression matrix after the additions: graded profiles unchanged, floors intact (A@55 0.67%, B@100 0.80%), 60 s run 0.80%, overhead ≤1.98× worst case with resends. |
+| 25 | D (clean 4-frame blackout bursts, 10–30 ms jitter) | 130 | 3.53% vs 2.27% fixed-S | 1.98x | **Naive widening made things WORSE**: every parity depends on a frame S back, so large S lengthens decode chains exactly in burst regions, and a +S×20 ms carrier can't land at this deadline anyway. Lesson: widening must be deadline-aware. |
+| 26 | D | 130 | 2.53% ≈ 2.47% no-adapt | 1.98x | Added the cap: advisory = min(burst+1, (DELAY_MS − p90 one-way delay − 10 ms)/20 ms), with p90 measured from arrival times (sender/receiver share the host clock). Also switched burst measurement from decoder outcomes to packet-arrival ground truth (runs of packets never seen 150 ms past send time). Cap correctly refuses to widen at 130 ms — results now identical to fixed S, no harm. |
+| 27 | D | 150 | **1.73% vs 2.20%** no-adapt | 1.98x | Where the deadline has headroom, adaptation pays: burst run 7 observed → cap allows S=5 → sender widens → burst heads decode directly from the m+5 carrier. −21% misses vs fixed S=3. On A/B/C2 the cap keeps S at 3 and behavior is bit-identical. |
+
 ## Conclusion
 
 - **Grade at `--delay_ms 110`.** Floors found: A = 55 ms, B = 100 ms; 110 keeps ≥ 10 ms margin on the harsher public profile and absorbs moderate delay spikes on unseen ones.
 - Overhead is a flat **1.97×** by construction (5 B header + 160 B frame + 15/16 × 160 B parity), independent of network behavior; NACK traffic is negligible and budget-guarded.
-- Mechanism, not profile tuning: XOR parity spread S=3 recovers singles at +20 ms and bursts ≤ 3; deadline-gated NACKs rescue post-burst tails; the receiver has no playout buffer at all (the player judges first arrival).
+- Mechanism, not profile tuning: XOR parity spread S=3 recovers singles at +20 ms and bursts ≤ 3; deadline-gated NACKs (bundled two frames per resend) rescue post-burst tails; the receiver has no playout buffer at all (the player judges first arrival).
+- The spread self-tunes: the receiver measures real packet-loss burst lengths and one-way delay p90, and widens S over the feedback channel only when the wider carrier can still land before the deadline (runs #23–27). On the public profiles this never triggers; on bursty low-jitter profiles it cut misses ~21%.

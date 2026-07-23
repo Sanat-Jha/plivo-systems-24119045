@@ -1,0 +1,2 @@
+{"name": "D2_short_blackouts", "loss": 0.005, "delay_min_ms": 10, "delay_max_ms": 30, "dup": 0.005,
+ "burst_loss": {"p_enter": 0.02, "p_exit": 0.4, "p_loss_in_burst": 1.0}}

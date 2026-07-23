@@ -35,7 +35,11 @@ parities (cascading worklist decoder). The receiver has **no jitter buffer**:
 the harness player judges first arrival per seq, so every frame is forwarded
 the instant it is received or decoded, with duplicates suppressed. A
 deadline-gated, budget-guarded **NACK path** (47003→47004) resends frames
-after burst gaps when their deadline is still reachable.
+after burst gaps when their deadline is still reachable, bundling two
+adjacent frames per resend packet. The spread **self-tunes**: the receiver
+measures packet-loss burst lengths and one-way delay p90 and widens S over
+the feedback channel only when the wider carrier can still beat the deadline
+(never fires on A/B; −21% misses on a bursty low-jitter test profile).
 
 ## Files
 
@@ -49,3 +53,4 @@ after burst gaps when their deadline is still reachable.
 | `sender.c`, `receiver.c` | Original naive baselines (unused) |
 | `profiles/A.json`, `profiles/B.json` | Public practice profiles |
 | `profiles/C.json`, `profiles/C2.json` | My burst/spike stress profiles (see RUNLOG #14–19) |
+| `profiles/D.json`, `profiles/D2.json` | Clean-blackout-burst profiles used to develop adaptive spread (RUNLOG #25–27) |

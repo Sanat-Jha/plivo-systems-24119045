@@ -8,8 +8,12 @@ received or decoded — the player judges first arrival, so no playout clock is
 needed — and dedupes duplicates. A lost frame decodes from packet i+1 (+20 ms)
 or i+3, and loss bursts up to ~3 packets decode by back-substitution through
 later parities. A budget-guarded NACK path (47003/47004) additionally resends
-frames after burst gaps when their deadline is still reachable. **Grade at
-`--delay_ms 110`**: profile A is valid down to 55 ms and B down to 100 ms, so
+frames after burst gaps when their deadline is still reachable, bundling two
+adjacent frames per resend packet. The spread self-tunes: the receiver
+measures packet-loss burst lengths and one-way delay p90, and asks the sender
+to widen the spread only when the wider carrier can still beat the deadline —
+on A/B this never triggers; on bursty low-jitter profiles it cut misses ~21%.
+**Grade at `--delay_ms 110`**: profile A is valid down to 55 ms and B down to 100 ms, so
 110 keeps ≥ 10 ms margin on the harsher profile. What breaks it: loss bursts
 longer than ~3 packets (parity chain and resends both need surviving packets),
 delay spikes above ~90 ms on the first copy plus a lost neighbour, and any

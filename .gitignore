@@ -8,3 +8,4 @@ __pycache__/
 # dev helpers (not part of submission)
 inspect_log.py
 sweep.sh
+test_matrix.sh
